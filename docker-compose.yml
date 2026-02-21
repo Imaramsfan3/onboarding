@@ -1,0 +1,152 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topics..."
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic customer-application
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic treatment-required
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic treatment-results
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic customer-application-response
+        echo "Topics created successfully:"
+        kafka-topics --list --bootstrap-server kafka:29092
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: appdata
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d appdata"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bff:
+    build: ./bff
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: customer-application
+      RESPONSE_TOPIC: customer-application-response
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rules-service:
+    build: ./rules-service
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  orchestration:
+    build: ./orchestration
+    ports:
+      - "8002:8002"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      RULES_SERVICE_URL: http://rules-service:8001
+      CUSTOMER_APPLICATION_TOPIC: customer-application
+      TREATMENT_REQUIRED_TOPIC: treatment-required
+      TREATMENT_RESULTS_TOPIC: treatment-results
+      CUSTOMER_APPLICATION_RESPONSE_TOPIC: customer-application-response
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      rules-service:
+        condition: service_healthy
+
+  appdata-consumer:
+    build: ./appdata-consumer
+    ports:
+      - "8003:8003"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DATABASE_URL: postgresql://appuser:apppass@postgres:5432/appdata
+      CUSTOMER_APPLICATION_TOPIC: customer-application
+      TREATMENT_REQUIRED_TOPIC: treatment-required
+      TREATMENT_RESULTS_TOPIC: treatment-results
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  individual-validation:
+    build: ./individual-validation
+    ports:
+      - "8004:8004"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TREATMENT_REQUIRED_TOPIC: treatment-required
+      TREATMENT_RESULTS_TOPIC: treatment-results
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_BFF_URL: http://localhost:8000
+    depends_on:
+      bff:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
